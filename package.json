@@ -1,0 +1,9 @@
+{
+  "name": "peptide-push-worker",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@pushforge/builder": "^1.0.0"
+  }
+}

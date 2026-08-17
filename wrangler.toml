@@ -1,0 +1,15 @@
+name = "peptide-push-worker"
+main = "src/index.js"
+compatibility_date = "2026-08-01"
+
+kv_namespaces = [
+  { binding = "SUBSCRIPTIONS", id = "b06c608479da49ec8f1976cdaa2ff779" }
+]
+
+# 12:00 UTC = 8:00 AM Eastern Daylight Time (EDT, currently in effect Aug 2026).
+# When clocks fall back to Eastern Standard Time (EST) in November, this will
+# fire at 7:00 AM instead — change "12" to "13" at that point if you want to
+# keep it at 8:00 AM year-round. Add more entries to this array for more
+# reminder times per day, e.g. an evening dose reminder.
+[triggers]
+crons = ["0 12 * * *"]
