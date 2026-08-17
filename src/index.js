@@ -3,7 +3,7 @@ import { buildPushHTTPRequest } from "@pushforge/builder";
 const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "POST, OPTIONS",
-  "Access-Control-Allow-Headers": "Content-Type",
+  "Access-Control-Allow-Headers": "Content-Type, X-API-Key",
 };
 
 // Change this if you're not in Eastern time — must be an IANA timezone name.
@@ -15,6 +15,16 @@ export default {
 
     if (request.method === "OPTIONS") {
       return new Response(null, { headers: CORS_HEADERS });
+    }
+
+    // every endpoint below requires the shared secret, so only your own app
+    // (which knows this key) can read or write anything on this Worker
+    const protectedPaths = ["/subscribe", "/peptides", "/test"];
+    if (protectedPaths.includes(url.pathname)) {
+      const key = request.headers.get("X-API-Key");
+      if (!env.API_SECRET || key !== env.API_SECRET) {
+        return new Response("Unauthorized", { status: 401, headers: CORS_HEADERS });
+      }
     }
 
     if (url.pathname === "/subscribe" && request.method === "POST") {
@@ -120,4 +130,3 @@ async function sendReminder(env) {
 
   return res.ok ? "sent" : `push service returned ${res.status}`;
 }
-
