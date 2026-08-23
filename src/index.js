@@ -9,6 +9,10 @@ const CORS_HEADERS = {
 // Change this if you're not in Eastern time — must be an IANA timezone name.
 const TIMEZONE = "America/New_York";
 
+// The exact cron string that fires the afternoon reminder — must match the
+// second entry in wrangler.toml's [triggers] crons array.
+const AFTERNOON_CRON = "0 18 * * *";
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -39,10 +43,11 @@ export default {
       return new Response("OK", { headers: CORS_HEADERS });
     }
 
-    // Manual test endpoint — POST here any time to fire a push immediately,
-    // using whatever's actually due today, same as the real schedule would.
+    // Manual test endpoint — POST here any time to fire a push immediately.
+    // Add ?mode=afternoon to test the split-dose PM reminder specifically.
     if (url.pathname === "/test" && request.method === "POST") {
-      const result = await sendReminder(env);
+      const mode = url.searchParams.get("mode") === "afternoon" ? "afternoon" : "morning";
+      const result = await sendReminder(env, mode);
       return new Response(result, { headers: CORS_HEADERS });
     }
 
@@ -50,7 +55,8 @@ export default {
   },
 
   async scheduled(event, env, ctx) {
-    ctx.waitUntil(sendReminder(env));
+    const mode = event.cron === AFTERNOON_CRON ? "afternoon" : "morning";
+    ctx.waitUntil(sendReminder(env, mode));
   },
 };
 
@@ -90,21 +96,35 @@ function isDueToday(p, today) {
   return false;
 }
 
-async function sendReminder(env) {
+// For the afternoon reminder, only surface compounds that are actually
+// dosed more than once a day, and specifically their afternoon/evening slot
+// (a single-dose compound scheduled for 8am has nothing left to remind about).
+function isAfternoonSplitDose(p) {
+  return Array.isArray(p.times) && p.times.length > 1 && p.times.some((t) => t >= "12:00");
+}
+
+async function sendReminder(env, mode) {
   const subRaw = await env.SUBSCRIPTIONS.get("subscription");
   if (!subRaw) return "no subscription stored yet";
 
   const peptidesRaw = await env.SUBSCRIPTIONS.get("peptides");
   const peptides = peptidesRaw ? JSON.parse(peptidesRaw) : [];
   const today = todayKey();
-  const due = peptides.filter((p) => isDueToday(p, today));
+
+  let due = peptides.filter((p) => isDueToday(p, today));
+  if (mode === "afternoon") {
+    due = due.filter(isAfternoonSplitDose);
+  }
 
   if (due.length === 0) {
-    return "nothing due today, no push sent";
+    return mode === "afternoon" ? "no afternoon split-doses due, no push sent" : "nothing due today, no push sent";
   }
 
   const names = due.map((p) => (p.dose && p.unit ? `${p.name} (${p.dose}${p.unit})` : p.name));
   const body = names.length <= 4 ? names.join(", ") : `${names.slice(0, 4).join(", ")} +${names.length - 4} more`;
+  const title = mode === "afternoon"
+    ? `${due.length} afternoon dose${due.length > 1 ? "s" : ""} due`
+    : `${due.length} dose${due.length > 1 ? "s" : ""} due today`;
 
   const subscription = JSON.parse(subRaw);
   const privateJWK = JSON.parse(env.VAPID_PRIVATE_KEY);
@@ -113,10 +133,7 @@ async function sendReminder(env) {
     privateJWK,
     subscription,
     message: {
-      payload: {
-        title: `${due.length} dose${due.length > 1 ? "s" : ""} due today`,
-        body,
-      },
+      payload: { title, body },
       adminContact: env.VAPID_SUBJECT,
       options: { ttl: 3600, urgency: "high" },
     },
@@ -130,3 +147,6 @@ async function sendReminder(env) {
 
   return res.ok ? "sent" : `push service returned ${res.status}`;
 }
+
+
+ 
