@@ -10,10 +10,11 @@ const CORS_HEADERS = {
 const TIMEZONE = "America/New_York";
 
 // How often the cron fires and how wide each checking window is, in minutes.
-// A compound scheduled for any time inside a given 5-minute window gets
-// picked up the next time this runs — so a dose set for 8:03 fires with
-// the 8:00-8:05 check, not necessarily at the literal minute 8:03.
 const WINDOW_MINUTES = 5;
+
+// Fixed daily check-in time for the Zone 2 cardio weekly progress summary.
+const CARDIO_SUMMARY_TIME = "10:00";
+const WEEKLY_ZONE2_GOAL = 150;
 
 export default {
   async fetch(request, env) {
@@ -23,9 +24,9 @@ export default {
       return new Response(null, { headers: CORS_HEADERS });
     }
 
-    const protectedPaths = ["/subscribe", "/peptides", "/test"];
+    const protectedPaths = ["/subscribe", "/peptides", "/cardio", "/test", "/debug"];
     if (protectedPaths.includes(url.pathname)) {
-      const key = request.headers.get("X-API-Key");
+      const key = request.headers.get("X-API-Key") || url.searchParams.get("key");
       if (!env.API_SECRET || key !== env.API_SECRET) {
         return new Response("Unauthorized", { status: 401, headers: CORS_HEADERS });
       }
@@ -43,15 +44,50 @@ export default {
       return new Response("OK", { headers: CORS_HEADERS });
     }
 
+    if (url.pathname === "/cardio" && request.method === "POST") {
+      const cardio = await request.json(); // { weekStart, minutes }
+      await env.SUBSCRIPTIONS.put("cardioWeek", JSON.stringify(cardio));
+      return new Response("OK", { headers: CORS_HEADERS });
+    }
+
     // Manual test endpoint.
-    //   POST /test          -> only sends if something is due in THIS exact
-    //                          5-minute window right now (tests the real logic)
-    //   POST /test?force=1  -> ignores timing and sends everything due today,
-    //                          useful for a quick end-to-end sanity check
+    //   POST /test                    -> only sends if a dose is due in THIS
+    //                                     exact 5-minute window right now
+    //   POST /test?force=1            -> ignores timing, sends everything due today
+    //   POST /test?type=cardio        -> only sends if it's cardio check-in time now
+    //   POST /test?type=cardio&force=1 -> sends the cardio summary immediately
     if (url.pathname === "/test" && request.method === "POST") {
       const force = url.searchParams.get("force") === "1";
-      const result = await checkAndSendDue(env, force);
+      const type = url.searchParams.get("type");
+      const result = type === "cardio" ? await checkCardioSummary(env, force) : await checkAndSendDue(env, force);
       return new Response(result, { headers: CORS_HEADERS });
+    }
+
+    // Visit this in a browser (with ?key=YOUR_API_SECRET appended) to see
+    // exactly what data the Worker currently has on file.
+    if (url.pathname === "/debug") {
+      const peptidesRaw = await env.SUBSCRIPTIONS.get("peptides");
+      const subRaw = await env.SUBSCRIPTIONS.get("subscription");
+      const cardioRaw = await env.SUBSCRIPTIONS.get("cardioWeek");
+      const peptides = peptidesRaw ? JSON.parse(peptidesRaw) : [];
+      const today = todayKey();
+      const nowMin = currentMinutes();
+      const summary = {
+        hasPushSubscription: !!subRaw,
+        workerThinksTodayIs: today,
+        workerThinksCurrentTimeIs: `${String(Math.floor(nowMin / 60)).padStart(2, "0")}:${String(nowMin % 60).padStart(2, "0")}`,
+        compoundCount: peptides.length,
+        compounds: peptides.map((p) => ({
+          name: p.name,
+          cycleType: p.cycleType,
+          times: p.times || (p.time ? [p.time] : []),
+          dueToday: isDueToday(p, today),
+        })),
+        cardioThisWeek: cardioRaw ? JSON.parse(cardioRaw) : null,
+      };
+      return new Response(JSON.stringify(summary, null, 2), {
+        headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
+      });
     }
 
     return new Response("Peptide push worker is running.", { headers: CORS_HEADERS });
@@ -59,6 +95,7 @@ export default {
 
   async scheduled(event, env, ctx) {
     ctx.waitUntil(checkAndSendDue(env, false));
+    ctx.waitUntil(checkCardioSummary(env, false));
   },
 };
 
@@ -78,6 +115,13 @@ function currentMinutes() {
 function timeToMinutes(t) {
   const [h, m] = (t || "08:00").split(":").map(Number);
   return h * 60 + (m || 0);
+}
+
+function inCurrentWindow(scheduledTime, nowMin) {
+  const windowStart = Math.floor(nowMin / WINDOW_MINUTES) * WINDOW_MINUTES;
+  const windowEnd = windowStart + WINDOW_MINUTES;
+  const mins = timeToMinutes(scheduledTime);
+  return { matches: mins >= windowStart && mins < windowEnd, windowStart };
 }
 
 function daysBetween(startKey, targetKey) {
@@ -111,10 +155,33 @@ function isDueToday(p, today) {
   return false;
 }
 
-async function checkAndSendDue(env, force) {
+async function sendPush(env, title, body) {
   const subRaw = await env.SUBSCRIPTIONS.get("subscription");
   if (!subRaw) return "no subscription stored yet";
 
+  const subscription = JSON.parse(subRaw);
+  const privateJWK = JSON.parse(env.VAPID_PRIVATE_KEY);
+
+  const { endpoint, headers, body: pushBody } = await buildPushHTTPRequest({
+    privateJWK,
+    subscription,
+    message: {
+      payload: { title, body },
+      adminContact: env.VAPID_SUBJECT,
+      options: { ttl: 3600, urgency: "high" },
+    },
+  });
+
+  const res = await fetch(endpoint, { method: "POST", headers, body: pushBody });
+
+  if (res.status === 404 || res.status === 410) {
+    await env.SUBSCRIPTIONS.delete("subscription");
+  }
+
+  return res.ok ? "sent" : `push service returned ${res.status}`;
+}
+
+async function checkAndSendDue(env, force) {
   const peptidesRaw = await env.SUBSCRIPTIONS.get("peptides");
   const peptides = peptidesRaw ? JSON.parse(peptidesRaw) : [];
   const today = todayKey();
@@ -147,24 +214,29 @@ async function checkAndSendDue(env, force) {
   const body = names.length <= 4 ? names.join(", ") : `${names.slice(0, 4).join(", ")} +${names.length - 4} more`;
   const title = `${due.length} dose${due.length > 1 ? "s" : ""} due now`;
 
-  const subscription = JSON.parse(subRaw);
-  const privateJWK = JSON.parse(env.VAPID_PRIVATE_KEY);
+  return sendPush(env, title, body);
+}
 
-  const { endpoint, headers, body: pushBody } = await buildPushHTTPRequest({
-    privateJWK,
-    subscription,
-    message: {
-      payload: { title, body },
-      adminContact: env.VAPID_SUBJECT,
-      options: { ttl: 3600, urgency: "high" },
-    },
-  });
+async function checkCardioSummary(env, force) {
+  const nowMin = currentMinutes();
+  const { matches } = inCurrentWindow(CARDIO_SUMMARY_TIME, nowMin);
+  if (!force && !matches) return "not cardio check-in time yet";
 
-  const res = await fetch(endpoint, { method: "POST", headers, body: pushBody });
-
-  if (res.status === 404 || res.status === 410) {
-    await env.SUBSCRIPTIONS.delete("subscription");
+  const today = todayKey();
+  if (!force) {
+    const sentKey = `cardioSent:${today}`;
+    const already = await env.SUBSCRIPTIONS.get(sentKey);
+    if (already) return "cardio summary already sent today";
+    await env.SUBSCRIPTIONS.put(sentKey, "1", { expirationTtl: 86400 });
   }
 
-  return res.ok ? "sent" : `push service returned ${res.status}`;
+  const cardioRaw = await env.SUBSCRIPTIONS.get("cardioWeek");
+  const cardio = cardioRaw ? JSON.parse(cardioRaw) : { minutes: 0 };
+  const minutes = cardio.minutes || 0;
+  const pct = Math.min(100, Math.round((minutes / WEEKLY_ZONE2_GOAL) * 100));
+
+  const title = "Zone 2 cardio check-in";
+  const body = `You're at ${pct}% of your weekly Zone 2 goal (${minutes}/${WEEKLY_ZONE2_GOAL} min).`;
+
+  return sendPush(env, title, body);
 }
