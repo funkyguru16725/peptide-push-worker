@@ -9,9 +9,11 @@ const CORS_HEADERS = {
 // Change this if you're not in Eastern time — must be an IANA timezone name.
 const TIMEZONE = "America/New_York";
 
-// The exact cron string that fires the afternoon reminder — must match the
-// second entry in wrangler.toml's [triggers] crons array.
-const AFTERNOON_CRON = "0 18 * * *";
+// How often the cron fires and how wide each checking window is, in minutes.
+// A compound scheduled for any time inside a given 5-minute window gets
+// picked up the next time this runs — so a dose set for 8:03 fires with
+// the 8:00-8:05 check, not necessarily at the literal minute 8:03.
+const WINDOW_MINUTES = 5;
 
 export default {
   async fetch(request, env) {
@@ -21,8 +23,6 @@ export default {
       return new Response(null, { headers: CORS_HEADERS });
     }
 
-    // every endpoint below requires the shared secret, so only your own app
-    // (which knows this key) can read or write anything on this Worker
     const protectedPaths = ["/subscribe", "/peptides", "/test"];
     if (protectedPaths.includes(url.pathname)) {
       const key = request.headers.get("X-API-Key");
@@ -43,11 +43,14 @@ export default {
       return new Response("OK", { headers: CORS_HEADERS });
     }
 
-    // Manual test endpoint — POST here any time to fire a push immediately.
-    // Add ?mode=afternoon to test the split-dose PM reminder specifically.
+    // Manual test endpoint.
+    //   POST /test          -> only sends if something is due in THIS exact
+    //                          5-minute window right now (tests the real logic)
+    //   POST /test?force=1  -> ignores timing and sends everything due today,
+    //                          useful for a quick end-to-end sanity check
     if (url.pathname === "/test" && request.method === "POST") {
-      const mode = url.searchParams.get("mode") === "afternoon" ? "afternoon" : "morning";
-      const result = await sendReminder(env, mode);
+      const force = url.searchParams.get("force") === "1";
+      const result = await checkAndSendDue(env, force);
       return new Response(result, { headers: CORS_HEADERS });
     }
 
@@ -55,14 +58,26 @@ export default {
   },
 
   async scheduled(event, env, ctx) {
-    const mode = event.cron === AFTERNOON_CRON ? "afternoon" : "morning";
-    ctx.waitUntil(sendReminder(env, mode));
+    ctx.waitUntil(checkAndSendDue(env, false));
   },
 };
 
 function todayKey() {
   const fmt = new Intl.DateTimeFormat("en-CA", { timeZone: TIMEZONE, year: "numeric", month: "2-digit", day: "2-digit" });
   return fmt.format(new Date()); // "YYYY-MM-DD"
+}
+
+function currentMinutes() {
+  const fmt = new Intl.DateTimeFormat("en-GB", { timeZone: TIMEZONE, hour: "2-digit", minute: "2-digit", hour12: false });
+  const parts = fmt.formatToParts(new Date());
+  const hour = parseInt(parts.find((p) => p.type === "hour").value, 10);
+  const minute = parseInt(parts.find((p) => p.type === "minute").value, 10);
+  return hour * 60 + minute;
+}
+
+function timeToMinutes(t) {
+  const [h, m] = (t || "08:00").split(":").map(Number);
+  return h * 60 + (m || 0);
 }
 
 function daysBetween(startKey, targetKey) {
@@ -96,35 +111,41 @@ function isDueToday(p, today) {
   return false;
 }
 
-// For the afternoon reminder, only surface compounds that are actually
-// dosed more than once a day, and specifically their afternoon/evening slot
-// (a single-dose compound scheduled for 8am has nothing left to remind about).
-function isAfternoonSplitDose(p) {
-  return Array.isArray(p.times) && p.times.length > 1 && p.times.some((t) => t >= "12:00");
-}
-
-async function sendReminder(env, mode) {
+async function checkAndSendDue(env, force) {
   const subRaw = await env.SUBSCRIPTIONS.get("subscription");
   if (!subRaw) return "no subscription stored yet";
 
   const peptidesRaw = await env.SUBSCRIPTIONS.get("peptides");
   const peptides = peptidesRaw ? JSON.parse(peptidesRaw) : [];
   const today = todayKey();
+  const nowMin = currentMinutes();
+  const windowStart = Math.floor(nowMin / WINDOW_MINUTES) * WINDOW_MINUTES;
+  const windowEnd = windowStart + WINDOW_MINUTES;
 
-  let due = peptides.filter((p) => isDueToday(p, today));
-  if (mode === "afternoon") {
-    due = due.filter(isAfternoonSplitDose);
+  const due = [];
+  for (const p of peptides) {
+    if (!isDueToday(p, today)) continue;
+    const times = Array.isArray(p.times) && p.times.length ? p.times : [p.time || "08:00"];
+    for (const t of times) {
+      const mins = timeToMinutes(t);
+      if (force || (mins >= windowStart && mins < windowEnd)) {
+        due.push({ name: p.name, dose: p.dose, unit: p.unit });
+      }
+    }
   }
 
-  if (due.length === 0) {
-    return mode === "afternoon" ? "no afternoon split-doses due, no push sent" : "nothing due today, no push sent";
+  if (due.length === 0) return force ? "nothing due today" : "nothing due in this window";
+
+  if (!force) {
+    const sentKey = `sent:${today}:${windowStart}`;
+    const already = await env.SUBSCRIPTIONS.get(sentKey);
+    if (already) return "already sent for this window";
+    await env.SUBSCRIPTIONS.put(sentKey, "1", { expirationTtl: 86400 });
   }
 
-  const names = due.map((p) => (p.dose && p.unit ? `${p.name} (${p.dose}${p.unit})` : p.name));
+  const names = due.map((d) => (d.dose && d.unit ? `${d.name} (${d.dose}${d.unit})` : d.name));
   const body = names.length <= 4 ? names.join(", ") : `${names.slice(0, 4).join(", ")} +${names.length - 4} more`;
-  const title = mode === "afternoon"
-    ? `${due.length} afternoon dose${due.length > 1 ? "s" : ""} due`
-    : `${due.length} dose${due.length > 1 ? "s" : ""} due today`;
+  const title = `${due.length} dose${due.length > 1 ? "s" : ""} due now`;
 
   const subscription = JSON.parse(subRaw);
   const privateJWK = JSON.parse(env.VAPID_PRIVATE_KEY);
@@ -147,6 +168,3 @@ async function sendReminder(env, mode) {
 
   return res.ok ? "sent" : `push service returned ${res.status}`;
 }
-
-
- 
