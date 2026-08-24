@@ -24,7 +24,7 @@ export default {
       return new Response(null, { headers: CORS_HEADERS });
     }
 
-    const protectedPaths = ["/subscribe", "/peptides", "/cardio", "/test", "/debug"];
+    const protectedPaths = ["/subscribe", "/peptides", "/cardio", "/training", "/test", "/debug"];
     if (protectedPaths.includes(url.pathname)) {
       const key = request.headers.get("X-API-Key") || url.searchParams.get("key");
       if (!env.API_SECRET || key !== env.API_SECRET) {
@@ -50,6 +50,12 @@ export default {
       return new Response("OK", { headers: CORS_HEADERS });
     }
 
+    if (url.pathname === "/training" && request.method === "POST") {
+      const training = await request.json(); // { date, type }
+      await env.SUBSCRIPTIONS.put("todayTraining", JSON.stringify(training));
+      return new Response("OK", { headers: CORS_HEADERS });
+    }
+
     // Manual test endpoint.
     //   POST /test                    -> only sends if a dose is due in THIS
     //                                     exact 5-minute window right now
@@ -69,19 +75,24 @@ export default {
       const peptidesRaw = await env.SUBSCRIPTIONS.get("peptides");
       const subRaw = await env.SUBSCRIPTIONS.get("subscription");
       const cardioRaw = await env.SUBSCRIPTIONS.get("cardioWeek");
+      const trainingRaw = await env.SUBSCRIPTIONS.get("todayTraining");
       const peptides = peptidesRaw ? JSON.parse(peptidesRaw) : [];
       const today = todayKey();
       const nowMin = currentMinutes();
+      const trainingData = trainingRaw ? JSON.parse(trainingRaw) : null;
+      const trainingType = trainingData && trainingData.date === today ? trainingData.type : null;
       const summary = {
         hasPushSubscription: !!subRaw,
         workerThinksTodayIs: today,
         workerThinksCurrentTimeIs: `${String(Math.floor(nowMin / 60)).padStart(2, "0")}:${String(nowMin % 60).padStart(2, "0")}`,
+        todaysTrainingType: trainingType,
         compoundCount: peptides.length,
         compounds: peptides.map((p) => ({
           name: p.name,
           cycleType: p.cycleType,
           times: p.times || (p.time ? [p.time] : []),
-          dueToday: isDueToday(p, today),
+          trainingDays: p.trainingDays || null,
+          dueToday: isDueToday(p, today) && passesTrainingFilter(p, trainingType),
         })),
         cardioThisWeek: cardioRaw ? JSON.parse(cardioRaw) : null,
       };
@@ -155,6 +166,15 @@ function isDueToday(p, today) {
   return false;
 }
 
+// Mirrors the app's logic exactly: no restriction = always passes; a
+// restriction with no training type picked yet for today also passes
+// (show by default), otherwise the picked type must be in the allowed list.
+function passesTrainingFilter(p, trainingType) {
+  if (!Array.isArray(p.trainingDays) || p.trainingDays.length === 0) return true;
+  if (!trainingType) return true;
+  return p.trainingDays.includes(trainingType);
+}
+
 async function sendPush(env, title, body) {
   const subRaw = await env.SUBSCRIPTIONS.get("subscription");
   if (!subRaw) return "no subscription stored yet";
@@ -189,9 +209,14 @@ async function checkAndSendDue(env, force) {
   const windowStart = Math.floor(nowMin / WINDOW_MINUTES) * WINDOW_MINUTES;
   const windowEnd = windowStart + WINDOW_MINUTES;
 
+  const trainingRaw = await env.SUBSCRIPTIONS.get("todayTraining");
+  const trainingData = trainingRaw ? JSON.parse(trainingRaw) : null;
+  const trainingType = trainingData && trainingData.date === today ? trainingData.type : null;
+
   const due = [];
   for (const p of peptides) {
     if (!isDueToday(p, today)) continue;
+    if (!passesTrainingFilter(p, trainingType)) continue;
     const times = Array.isArray(p.times) && p.times.length ? p.times : [p.time || "08:00"];
     for (const t of times) {
       const mins = timeToMinutes(t);
