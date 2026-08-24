@@ -236,7 +236,7 @@ async function checkAndSendDue(env, force) {
   }
 
   const names = due.map((d) => (d.dose && d.unit ? `${d.name} (${d.dose}${d.unit})` : d.name));
-  const body = names.length <= 4 ? names.join(", ") : `${names.slice(0, 4).join(", ")} +${names.length - 4} more`;
+  const body = names.join("\n");
   const title = `${due.length} dose${due.length > 1 ? "s" : ""} due now`;
 
   return sendPush(env, title, body);
