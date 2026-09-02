@@ -131,6 +131,11 @@ export default {
 
         const aiData = await aiRes.json();
         const text = (aiData.content || []).filter((b) => b.type === "text").map((b) => b.text).join("\n");
+        if (!text) {
+          return new Response(JSON.stringify({
+            error: `Got an empty response from Anthropic. stop_reason: ${aiData.stop_reason || "unknown"}. Raw response: ${JSON.stringify(aiData).slice(0, 600)}`,
+          }), { status: 502, headers: { ...CORS_HEADERS, "Content-Type": "application/json" } });
+        }
         return new Response(JSON.stringify({ text }), { headers: { ...CORS_HEADERS, "Content-Type": "application/json" } });
       } catch (e) {
         return new Response(JSON.stringify({ error: `Request failed: ${e.message}` }), {
