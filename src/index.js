@@ -29,7 +29,7 @@ export default {
       return new Response(null, { headers: CORS_HEADERS });
     }
 
-    const protectedPaths = ["/subscribe", "/peptides", "/cardio", "/training", "/test", "/debug"];
+    const protectedPaths = ["/subscribe", "/peptides", "/cardio", "/training", "/test", "/debug", "/ai-insight"];
     if (protectedPaths.includes(url.pathname)) {
       const key = request.headers.get("X-API-Key") || url.searchParams.get("key");
       if (!env.API_SECRET || key !== env.API_SECRET) {
@@ -76,6 +76,67 @@ export default {
         type === "import" ? await checkWeeklyImportReminder(env, force) :
         await checkAndSendDue(env, force);
       return new Response(result, { headers: CORS_HEADERS });
+    }
+
+    // POST /ai-insight — generates a written health insight from a data
+    // summary and optional attached photos, using your own Anthropic API key
+    // (stored as the ANTHROPIC_API_KEY secret, never exposed to the app).
+    if (url.pathname === "/ai-insight" && request.method === "POST") {
+      if (!env.ANTHROPIC_API_KEY) {
+        return new Response(JSON.stringify({ error: "No Anthropic API key configured on this Worker yet." }), {
+          status: 500, headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
+        });
+      }
+      try {
+        const { dataSummary, note, images } = await request.json();
+        const content = [
+          {
+            type: "text",
+            text:
+              "You're looking at someone's own personal health-tracking data (peptides/supplements, macros, weight, training, body composition). " +
+              "Give a direct, specific, genuinely useful written analysis — not generic advice. Reference actual numbers from the data. " +
+              "If a photo is attached, incorporate visual observations about physique and body composition alongside the numeric data. " +
+              "Keep it grounded in lifestyle factors (diet, training, cardio, sleep, recovery) — do not recommend or suggest starting, stopping, " +
+              "or adjusting any specific compound, supplement, or medication; that's outside what's appropriate here. " +
+              "This is not medical advice, and you should note that if relevant, but don't be excessively hedgy — be concrete and helpful.\n\n" +
+              "DATA:\n" + dataSummary +
+              (note ? `\n\nSPECIFIC FOCUS REQUESTED: ${note}` : ""),
+          },
+        ];
+        (images || []).slice(0, 3).forEach((dataUrl) => {
+          const match = /^data:(image\/\w+);base64,(.+)$/.exec(dataUrl);
+          if (match) content.push({ type: "image", source: { type: "base64", media_type: match[1], data: match[2] } });
+        });
+
+        const aiRes = await fetch("https://api.anthropic.com/v1/messages", {
+          method: "POST",
+          headers: {
+            "x-api-key": env.ANTHROPIC_API_KEY,
+            "anthropic-version": "2023-06-01",
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            model: "claude-sonnet-5",
+            max_tokens: 1024,
+            messages: [{ role: "user", content }],
+          }),
+        });
+
+        if (!aiRes.ok) {
+          const errText = await aiRes.text();
+          return new Response(JSON.stringify({ error: `Anthropic API returned ${aiRes.status}: ${errText.slice(0, 300)}` }), {
+            status: 502, headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
+          });
+        }
+
+        const aiData = await aiRes.json();
+        const text = (aiData.content || []).filter((b) => b.type === "text").map((b) => b.text).join("\n");
+        return new Response(JSON.stringify({ text }), { headers: { ...CORS_HEADERS, "Content-Type": "application/json" } });
+      } catch (e) {
+        return new Response(JSON.stringify({ error: `Request failed: ${e.message}` }), {
+          status: 500, headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
+        });
+      }
     }
 
     // Visit this in a browser (with ?key=YOUR_API_SECRET appended) to see
