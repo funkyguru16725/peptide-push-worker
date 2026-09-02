@@ -196,6 +196,8 @@ export default {
         trainingDays: p.trainingDays || null,
         dueToday: isDueToday(p, today) && passesTrainingFilter(p, trainingType),
       });
+      const statusRaw = await env.SUBSCRIPTIONS.get("status");
+      const status = statusRaw ? JSON.parse(statusRaw) : null;
       const summary = {
         hasPushSubscription: !!subRaw,
         hasAnthropicKey: !!env.ANTHROPIC_API_KEY,
@@ -209,6 +211,12 @@ export default {
         supplementCount: supplements.length,
         supplements: supplements.map(describeCompound),
         cardioThisWeek: cardioRaw ? JSON.parse(cardioRaw) : null,
+        status,
+        statusComputed: status ? {
+          daysSinceLastPhoto: status.lastPhotoDate ? daysBetween(status.lastPhotoDate, today) : "no lastPhotoDate synced",
+          daysSinceLastWaist: status.lastWaistDate ? daysBetween(status.lastWaistDate, today) : "no lastWaistDate synced",
+          daysSinceLastBloodTest: status.lastBloodTestDate ? daysBetween(status.lastBloodTestDate, today) : "no lastBloodTestDate synced",
+        } : "no status synced yet",
       };
       return new Response(JSON.stringify(summary, null, 2), {
         headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
@@ -584,5 +592,5 @@ async function checkAdherenceDrop(env, force) {
   const body = dropped.map((c) => `${c.name}: ${c.taken}/${c.eligible} this week`).join("\n");
   return sendPush(env, "Adherence dropped this week", body);
 }
-
+ 
 
