@@ -16,6 +16,11 @@ const WINDOW_MINUTES = 5;
 const CARDIO_SUMMARY_TIME = "10:00";
 const WEEKLY_ZONE2_GOAL = 150;
 
+// Weekly reminder to import manually-uploaded data (MyFitnessPal, Renpho,
+// Fitbit/Google Health) — fires once, on Sundays, at this time.
+const IMPORT_REMINDER_TIME = "09:00";
+const IMPORT_REMINDER_DAY = 0; // 0 = Sunday
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -62,10 +67,14 @@ export default {
     //   POST /test?force=1            -> ignores timing, sends everything due today
     //   POST /test?type=cardio        -> only sends if it's cardio check-in time now
     //   POST /test?type=cardio&force=1 -> sends the cardio summary immediately
+    //   POST /test?type=import&force=1 -> sends the weekly import reminder immediately
     if (url.pathname === "/test" && request.method === "POST") {
       const force = url.searchParams.get("force") === "1";
       const type = url.searchParams.get("type");
-      const result = type === "cardio" ? await checkCardioSummary(env, force) : await checkAndSendDue(env, force);
+      const result =
+        type === "cardio" ? await checkCardioSummary(env, force) :
+        type === "import" ? await checkWeeklyImportReminder(env, force) :
+        await checkAndSendDue(env, force);
       return new Response(result, { headers: CORS_HEADERS });
     }
 
@@ -85,6 +94,8 @@ export default {
         hasPushSubscription: !!subRaw,
         workerThinksTodayIs: today,
         workerThinksCurrentTimeIs: `${String(Math.floor(nowMin / 60)).padStart(2, "0")}:${String(nowMin % 60).padStart(2, "0")}`,
+        workerThinksDayOfWeekIs: ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"][currentDayOfWeek()],
+        isImportReminderDay: currentDayOfWeek() === IMPORT_REMINDER_DAY,
         todaysTrainingType: trainingType,
         compoundCount: peptides.length,
         compounds: peptides.map((p) => ({
@@ -107,6 +118,7 @@ export default {
   async scheduled(event, env, ctx) {
     ctx.waitUntil(checkAndSendDue(env, false));
     ctx.waitUntil(checkCardioSummary(env, false));
+    ctx.waitUntil(checkWeeklyImportReminder(env, false));
   },
 };
 
@@ -121,6 +133,14 @@ function currentMinutes() {
   const hour = parseInt(parts.find((p) => p.type === "hour").value, 10);
   const minute = parseInt(parts.find((p) => p.type === "minute").value, 10);
   return hour * 60 + minute;
+}
+
+function currentDayOfWeek() {
+  // Returns 0 (Sunday) through 6 (Saturday) in the configured timezone,
+  // not the Worker's own UTC day, which can be a different calendar day.
+  const fmt = new Intl.DateTimeFormat("en-US", { timeZone: TIMEZONE, weekday: "short" });
+  const short = fmt.format(new Date());
+  return ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"].indexOf(short);
 }
 
 function timeToMinutes(t) {
@@ -262,6 +282,29 @@ async function checkCardioSummary(env, force) {
 
   const title = "Zone 2 cardio check-in";
   const body = `You're at ${pct}% of your weekly Zone 2 goal (${minutes}/${WEEKLY_ZONE2_GOAL} min).`;
+
+  return sendPush(env, title, body);
+}
+
+async function checkWeeklyImportReminder(env, force) {
+  if (!force) {
+    const dow = currentDayOfWeek();
+    if (dow !== IMPORT_REMINDER_DAY) return "not the reminder day";
+    const nowMin = currentMinutes();
+    const { matches } = inCurrentWindow(IMPORT_REMINDER_TIME, nowMin);
+    if (!matches) return "not reminder time yet";
+  }
+
+  const today = todayKey();
+  if (!force) {
+    const sentKey = `importReminderSent:${today}`;
+    const already = await env.SUBSCRIPTIONS.get(sentKey);
+    if (already) return "import reminder already sent today";
+    await env.SUBSCRIPTIONS.put(sentKey, "1", { expirationTtl: 86400 });
+  }
+
+  const title = "Weekly data check-in";
+  const body = "Time to import last week's data: MyFitnessPal, Renpho, and Fitbit/Google Health.";
 
   return sendPush(env, title, body);
 }
