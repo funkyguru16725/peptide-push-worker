@@ -153,6 +153,7 @@ export default {
       const trainingType = trainingData && trainingData.date === today ? trainingData.type : null;
       const summary = {
         hasPushSubscription: !!subRaw,
+        hasAnthropicKey: !!env.ANTHROPIC_API_KEY,
         workerThinksTodayIs: today,
         workerThinksCurrentTimeIs: `${String(Math.floor(nowMin / 60)).padStart(2, "0")}:${String(nowMin % 60).padStart(2, "0")}`,
         workerThinksDayOfWeekIs: ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"][currentDayOfWeek()],
