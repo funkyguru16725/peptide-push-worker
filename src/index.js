@@ -29,7 +29,7 @@ export default {
       return new Response(null, { headers: CORS_HEADERS });
     }
 
-    const protectedPaths = ["/subscribe", "/peptides", "/supplements", "/cardio", "/training", "/test", "/debug", "/ai-insight"];
+    const protectedPaths = ["/subscribe", "/peptides", "/supplements", "/status", "/cardio", "/training", "/test", "/debug", "/ai-insight"];
     if (protectedPaths.includes(url.pathname)) {
       const key = request.headers.get("X-API-Key") || url.searchParams.get("key");
       if (!env.API_SECRET || key !== env.API_SECRET) {
@@ -55,6 +55,12 @@ export default {
       return new Response("OK", { headers: CORS_HEADERS });
     }
 
+    if (url.pathname === "/status" && request.method === "POST") {
+      const status = await request.json();
+      await env.SUBSCRIPTIONS.put("status", JSON.stringify(status));
+      return new Response("OK", { headers: CORS_HEADERS });
+    }
+
     if (url.pathname === "/cardio" && request.method === "POST") {
       const cardio = await request.json(); // { weekStart, minutes }
       await env.SUBSCRIPTIONS.put("cardioWeek", JSON.stringify(cardio));
@@ -71,16 +77,30 @@ export default {
     //   POST /test                    -> only sends if a dose is due in THIS
     //                                     exact 5-minute window right now
     //   POST /test?force=1            -> ignores timing, sends everything due today
-    //   POST /test?type=cardio        -> only sends if it's cardio check-in time now
-    //   POST /test?type=cardio&force=1 -> sends the cardio summary immediately
-    //   POST /test?type=import&force=1 -> sends the weekly import reminder immediately
+    //   POST /test?type=cardio&force=1        -> cardio check-in
+    //   POST /test?type=import&force=1        -> weekly import reminder
+    //   POST /test?type=lowsupply&force=1     -> low supply alert
+    //   POST /test?type=goal&force=1          -> goal milestone
+    //   POST /test?type=weeklysummary&force=1 -> weekly summary push
+    //   POST /test?type=bloodtest&force=1     -> blood test overdue reminder
+    //   POST /test?type=markers&force=1       -> flagged blood markers
+    //   POST /test?type=progress&force=1      -> progress photo/waist reminder
+    //   POST /test?type=adherence&force=1     -> adherence drop alert
     if (url.pathname === "/test" && request.method === "POST") {
       const force = url.searchParams.get("force") === "1";
       const type = url.searchParams.get("type");
-      const result =
-        type === "cardio" ? await checkCardioSummary(env, force) :
-        type === "import" ? await checkWeeklyImportReminder(env, force) :
-        await checkAndSendDue(env, force);
+      const checks = {
+        cardio: checkCardioSummary,
+        import: checkWeeklyImportReminder,
+        lowsupply: checkLowSupply,
+        goal: checkGoalMilestone,
+        weeklysummary: checkWeeklySummaryPush,
+        bloodtest: checkBloodTestReminder,
+        markers: checkFlaggedMarkers,
+        progress: checkProgressReminder,
+        adherence: checkAdherenceDrop,
+      };
+      const result = checks[type] ? await checks[type](env, force) : await checkAndSendDue(env, force);
       return new Response(result, { headers: CORS_HEADERS });
     }
 
@@ -202,6 +222,13 @@ export default {
     ctx.waitUntil(checkAndSendDue(env, false));
     ctx.waitUntil(checkCardioSummary(env, false));
     ctx.waitUntil(checkWeeklyImportReminder(env, false));
+    ctx.waitUntil(checkLowSupply(env, false));
+    ctx.waitUntil(checkGoalMilestone(env, false));
+    ctx.waitUntil(checkWeeklySummaryPush(env, false));
+    ctx.waitUntil(checkBloodTestReminder(env, false));
+    ctx.waitUntil(checkFlaggedMarkers(env, false));
+    ctx.waitUntil(checkProgressReminder(env, false));
+    ctx.waitUntil(checkAdherenceDrop(env, false));
   },
 };
 
@@ -392,4 +419,170 @@ async function checkWeeklyImportReminder(env, force) {
   const body = "Time to import last week's data: MyFitnessPal, Renpho, and Fitbit/Google Health.";
 
   return sendPush(env, title, body);
-}  
+}
+
+const LOW_SUPPLY_THRESHOLD = 3;
+const BLOOD_TEST_REMINDER_DAYS = 90;
+const PHOTO_REMINDER_DAYS = 14;
+const WEEKLY_SUMMARY_TIME = "18:00";
+const FLAGGED_MARKERS_TIME = "18:15";
+const ADHERENCE_DROP_TIME = "18:30";
+const WEEKLY_CHECK_DAY = 0; // Sunday, matching the other weekly notifications
+
+async function getStatus(env) {
+  const raw = await env.SUBSCRIPTIONS.get("status");
+  return raw ? JSON.parse(raw) : {};
+}
+
+// Event-driven (not time-based): runs every cron tick, but only actually
+// sends once per compound crossing the threshold — resets automatically
+// once dosesRemaining goes back above it (e.g., after a refill).
+async function checkLowSupply(env, force) {
+  const peptidesRaw = await env.SUBSCRIPTIONS.get("peptides");
+  const supplementsRaw = await env.SUBSCRIPTIONS.get("supplements");
+  const all = [...(peptidesRaw ? JSON.parse(peptidesRaw) : []), ...(supplementsRaw ? JSON.parse(supplementsRaw) : [])];
+  const low = all.filter((p) => p.dosesRemaining != null && p.dosesRemaining <= LOW_SUPPLY_THRESHOLD && p.dosesRemaining >= 0);
+
+  const results = [];
+  for (const p of low) {
+    const key = `lowSupplyNotified:${p.id}`;
+    const already = await env.SUBSCRIPTIONS.get(key);
+    if (!force && already) continue;
+    await env.SUBSCRIPTIONS.put(key, "1", { expirationTtl: 30 * 86400 });
+    results.push(p);
+  }
+  // Clear the flag for anything that's been refilled back above the threshold,
+  // so a future low-supply dip notifies again instead of staying silenced.
+  for (const p of all) {
+    if (p.dosesRemaining != null && p.dosesRemaining > LOW_SUPPLY_THRESHOLD) {
+      await env.SUBSCRIPTIONS.delete(`lowSupplyNotified:${p.id}`);
+    }
+  }
+  if (results.length === 0) return "nothing low on supply";
+
+  const body = results.map((p) => `${p.name}: ${p.dosesRemaining} dose${p.dosesRemaining === 1 ? "" : "s"} left`).join("\n");
+  return sendPush(env, "Running low on supply", body);
+}
+
+// Event-driven: checks whenever the app syncs status, dedup keyed to the
+// specific goal so changing your target re-arms the notification.
+async function checkGoalMilestone(env, force) {
+  const status = await getStatus(env);
+  const { goal, currentBodyFat } = status;
+  if (!goal || goal.type !== "lose_fat" || goal.targetBodyFatPct == null || currentBodyFat == null) return "no active fat-loss goal";
+  if (currentBodyFat > goal.targetBodyFatPct) return "goal not yet reached";
+
+  const goalSignature = `${goal.targetBodyFatPct}`;
+  const key = `goalMilestoneNotified:${goalSignature}`;
+  if (!force) {
+    const already = await env.SUBSCRIPTIONS.get(key);
+    if (already) return "already notified for this goal";
+  }
+  await env.SUBSCRIPTIONS.put(key, "1");
+  return sendPush(env, "Goal reached", `You've hit your ${goal.targetBodyFatPct}% body fat goal — currently at ${currentBodyFat}%.`);
+}
+
+async function checkWeeklySummaryPush(env, force) {
+  if (!force) {
+    if (currentDayOfWeek() !== WEEKLY_CHECK_DAY) return "not the weekly check day";
+    const { matches } = inCurrentWindow(WEEKLY_SUMMARY_TIME, currentMinutes());
+    if (!matches) return "not weekly summary time yet";
+  }
+  const today = todayKey();
+  if (!force) {
+    const sentKey = `weeklySummarySent:${today}`;
+    const already = await env.SUBSCRIPTIONS.get(sentKey);
+    if (already) return "weekly summary already sent today";
+    await env.SUBSCRIPTIONS.put(sentKey, "1", { expirationTtl: 86400 });
+  }
+  const status = await getStatus(env);
+  if (!status.weeklySummaryText) return "no weekly summary data synced yet";
+  return sendPush(env, "Your week in review", status.weeklySummaryText);
+}
+
+async function checkBloodTestReminder(env, force) {
+  const status = await getStatus(env);
+  if (!status.lastBloodTestDate) return "no blood test on file";
+  const days = daysBetween(status.lastBloodTestDate, todayKey());
+  if (days < BLOOD_TEST_REMINDER_DAYS) return "not overdue yet";
+
+  const today = todayKey();
+  if (!force) {
+    const sentKey = `bloodReminderSent:${today}`;
+    const already = await env.SUBSCRIPTIONS.get(sentKey);
+    if (already) return "already reminded today";
+    // Re-remind weekly once overdue, not every single day.
+    const weekKey = `bloodReminderWeek:${Math.floor(days / 7)}`;
+    const alreadyThisWeek = await env.SUBSCRIPTIONS.get(weekKey);
+    if (alreadyThisWeek) return "already reminded this week";
+    await env.SUBSCRIPTIONS.put(sentKey, "1", { expirationTtl: 86400 });
+    await env.SUBSCRIPTIONS.put(weekKey, "1", { expirationTtl: 8 * 86400 });
+  }
+  return sendPush(env, "Labs are overdue", `It's been ${days} days since your last blood test.`);
+}
+
+async function checkFlaggedMarkers(env, force) {
+  if (!force) {
+    if (currentDayOfWeek() !== WEEKLY_CHECK_DAY) return "not the weekly check day";
+    const { matches } = inCurrentWindow(FLAGGED_MARKERS_TIME, currentMinutes());
+    if (!matches) return "not flagged-markers time yet";
+  }
+  const today = todayKey();
+  if (!force) {
+    const sentKey = `flaggedMarkersSent:${today}`;
+    const already = await env.SUBSCRIPTIONS.get(sentKey);
+    if (already) return "already sent today";
+    await env.SUBSCRIPTIONS.put(sentKey, "1", { expirationTtl: 86400 });
+  }
+  const status = await getStatus(env);
+  const flagged = status.flaggedMarkers || [];
+  if (flagged.length === 0) return "nothing flagged";
+  const body = flagged.map((m) => `${m.name}: ${m.value}${m.unit || ""} (${m.status})`).join("\n");
+  return sendPush(env, "Blood markers outside range", body);
+}
+
+async function checkProgressReminder(env, force) {
+  const status = await getStatus(env);
+  const today = todayKey();
+  const photoOverdue = !status.lastPhotoDate || daysBetween(status.lastPhotoDate, today) >= PHOTO_REMINDER_DAYS;
+  const waistOverdue = !status.lastWaistDate || daysBetween(status.lastWaistDate, today) >= PHOTO_REMINDER_DAYS;
+  if (!photoOverdue && !waistOverdue) return "not overdue yet";
+
+  if (!force) {
+    const sentKey = `progressReminderSent:${today}`;
+    const already = await env.SUBSCRIPTIONS.get(sentKey);
+    if (already) return "already reminded today";
+    const weekKey = `progressReminderWeek:${Math.floor(Date.parse(today) / (7 * 86400000))}`;
+    const alreadyThisWeek = await env.SUBSCRIPTIONS.get(weekKey);
+    if (alreadyThisWeek) return "already reminded this week";
+    await env.SUBSCRIPTIONS.put(sentKey, "1", { expirationTtl: 86400 });
+    await env.SUBSCRIPTIONS.put(weekKey, "1", { expirationTtl: 8 * 86400 });
+  }
+  const parts = [];
+  if (photoOverdue) parts.push("a progress photo");
+  if (waistOverdue) parts.push("your waist measurement");
+  return sendPush(env, "Progress check-in", `Time to log ${parts.join(" and ")} — it's been ${PHOTO_REMINDER_DAYS}+ days.`);
+}
+
+async function checkAdherenceDrop(env, force) {
+  if (!force) {
+    if (currentDayOfWeek() !== WEEKLY_CHECK_DAY) return "not the weekly check day";
+    const { matches } = inCurrentWindow(ADHERENCE_DROP_TIME, currentMinutes());
+    if (!matches) return "not adherence-check time yet";
+  }
+  const today = todayKey();
+  if (!force) {
+    const sentKey = `adherenceDropSent:${today}`;
+    const already = await env.SUBSCRIPTIONS.get(sentKey);
+    if (already) return "already sent today";
+    await env.SUBSCRIPTIONS.put(sentKey, "1", { expirationTtl: 86400 });
+  }
+  const status = await getStatus(env);
+  const adherence = status.adherence || [];
+  const dropped = adherence.filter((c) => c.eligible > 0 && c.taken / c.eligible < 0.7);
+  if (dropped.length === 0) return "no adherence drops";
+  const body = dropped.map((c) => `${c.name}: ${c.taken}/${c.eligible} this week`).join("\n");
+  return sendPush(env, "Adherence dropped this week", body);
+}
+
+
