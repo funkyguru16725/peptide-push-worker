@@ -88,12 +88,15 @@ export default {
         });
       }
       try {
-        const { dataSummary, note, images } = await request.json();
-        const content = [
-          {
-            type: "text",
-            text:
-              "You're looking at someone's own personal health-tracking data (peptides/supplements, macros, weight, training, body composition). " +
+        const { dataSummary, note, images, history } = await request.json();
+        const isFollowUp = Array.isArray(history) && history.length > 0;
+
+        const newContent = [];
+        newContent.push({
+          type: "text",
+          text: isFollowUp
+            ? (note || "Please continue.")
+            : "You're looking at someone's own personal health-tracking data (peptides/supplements, macros, weight, training, body composition). " +
               "Give a direct, specific, genuinely useful written analysis — not generic advice. Reference actual numbers from the data. " +
               "If a photo is attached, incorporate visual observations about physique and body composition alongside the numeric data. " +
               "Keep it grounded in lifestyle factors (diet, training, cardio, sleep, recovery) — do not recommend or suggest starting, stopping, " +
@@ -101,12 +104,13 @@ export default {
               "This is not medical advice, and you should note that if relevant, but don't be excessively hedgy — be concrete and helpful.\n\n" +
               "DATA:\n" + dataSummary +
               (note ? `\n\nSPECIFIC FOCUS REQUESTED: ${note}` : ""),
-          },
-        ];
+        });
         (images || []).slice(0, 3).forEach((dataUrl) => {
           const match = /^data:(image\/\w+);base64,(.+)$/.exec(dataUrl);
-          if (match) content.push({ type: "image", source: { type: "base64", media_type: match[1], data: match[2] } });
+          if (match) newContent.push({ type: "image", source: { type: "base64", media_type: match[1], data: match[2] } });
         });
+
+        const messages = [...(isFollowUp ? history : []), { role: "user", content: newContent }];
 
         const aiRes = await fetch("https://api.anthropic.com/v1/messages", {
           method: "POST",
@@ -119,7 +123,7 @@ export default {
             model: "claude-sonnet-5",
             max_tokens: 8192,
             thinking: { type: "disabled" },
-            messages: [{ role: "user", content }],
+            messages,
           }),
         });
 
