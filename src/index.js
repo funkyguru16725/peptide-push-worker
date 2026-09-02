@@ -29,7 +29,7 @@ export default {
       return new Response(null, { headers: CORS_HEADERS });
     }
 
-    const protectedPaths = ["/subscribe", "/peptides", "/cardio", "/training", "/test", "/debug", "/ai-insight"];
+    const protectedPaths = ["/subscribe", "/peptides", "/supplements", "/cardio", "/training", "/test", "/debug", "/ai-insight"];
     if (protectedPaths.includes(url.pathname)) {
       const key = request.headers.get("X-API-Key") || url.searchParams.get("key");
       if (!env.API_SECRET || key !== env.API_SECRET) {
@@ -46,6 +46,12 @@ export default {
     if (url.pathname === "/peptides" && request.method === "POST") {
       const peptides = await request.json();
       await env.SUBSCRIPTIONS.put("peptides", JSON.stringify(peptides));
+      return new Response("OK", { headers: CORS_HEADERS });
+    }
+
+    if (url.pathname === "/supplements" && request.method === "POST") {
+      const supplements = await request.json();
+      await env.SUBSCRIPTIONS.put("supplements", JSON.stringify(supplements));
       return new Response("OK", { headers: CORS_HEADERS });
     }
 
@@ -153,14 +159,23 @@ export default {
     // exactly what data the Worker currently has on file.
     if (url.pathname === "/debug") {
       const peptidesRaw = await env.SUBSCRIPTIONS.get("peptides");
+      const supplementsRaw = await env.SUBSCRIPTIONS.get("supplements");
       const subRaw = await env.SUBSCRIPTIONS.get("subscription");
       const cardioRaw = await env.SUBSCRIPTIONS.get("cardioWeek");
       const trainingRaw = await env.SUBSCRIPTIONS.get("todayTraining");
       const peptides = peptidesRaw ? JSON.parse(peptidesRaw) : [];
+      const supplements = supplementsRaw ? JSON.parse(supplementsRaw) : [];
       const today = todayKey();
       const nowMin = currentMinutes();
       const trainingData = trainingRaw ? JSON.parse(trainingRaw) : null;
       const trainingType = trainingData && trainingData.date === today ? trainingData.type : null;
+      const describeCompound = (p) => ({
+        name: p.name,
+        cycleType: p.cycleType,
+        times: p.times || (p.time ? [p.time] : []),
+        trainingDays: p.trainingDays || null,
+        dueToday: isDueToday(p, today) && passesTrainingFilter(p, trainingType),
+      });
       const summary = {
         hasPushSubscription: !!subRaw,
         hasAnthropicKey: !!env.ANTHROPIC_API_KEY,
@@ -170,13 +185,9 @@ export default {
         isImportReminderDay: currentDayOfWeek() === IMPORT_REMINDER_DAY,
         todaysTrainingType: trainingType,
         compoundCount: peptides.length,
-        compounds: peptides.map((p) => ({
-          name: p.name,
-          cycleType: p.cycleType,
-          times: p.times || (p.time ? [p.time] : []),
-          trainingDays: p.trainingDays || null,
-          dueToday: isDueToday(p, today) && passesTrainingFilter(p, trainingType),
-        })),
+        compounds: peptides.map(describeCompound),
+        supplementCount: supplements.length,
+        supplements: supplements.map(describeCompound),
         cardioThisWeek: cardioRaw ? JSON.parse(cardioRaw) : null,
       };
       return new Response(JSON.stringify(summary, null, 2), {
@@ -296,6 +307,8 @@ async function sendPush(env, title, body) {
 async function checkAndSendDue(env, force) {
   const peptidesRaw = await env.SUBSCRIPTIONS.get("peptides");
   const peptides = peptidesRaw ? JSON.parse(peptidesRaw) : [];
+  const supplementsRaw = await env.SUBSCRIPTIONS.get("supplements");
+  const supplements = supplementsRaw ? JSON.parse(supplementsRaw) : [];
   const today = todayKey();
   const nowMin = currentMinutes();
   const windowStart = Math.floor(nowMin / WINDOW_MINUTES) * WINDOW_MINUTES;
@@ -306,7 +319,7 @@ async function checkAndSendDue(env, force) {
   const trainingType = trainingData && trainingData.date === today ? trainingData.type : null;
 
   const due = [];
-  for (const p of peptides) {
+  for (const p of [...peptides, ...supplements]) {
     if (!isDueToday(p, today)) continue;
     if (!passesTrainingFilter(p, trainingType)) continue;
     const times = Array.isArray(p.times) && p.times.length ? p.times : [p.time || "08:00"];
@@ -379,4 +392,4 @@ async function checkWeeklyImportReminder(env, force) {
   const body = "Time to import last week's data: MyFitnessPal, Renpho, and Fitbit/Google Health.";
 
   return sendPush(env, title, body);
-}
+}  
