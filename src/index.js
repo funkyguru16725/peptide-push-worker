@@ -29,7 +29,7 @@ export default {
       return new Response(null, { headers: CORS_HEADERS });
     }
 
-    const protectedPaths = ["/subscribe", "/peptides", "/supplements", "/status", "/cardio", "/training", "/test", "/debug", "/ai-insight"];
+    const protectedPaths = ["/subscribe", "/peptides", "/supplements", "/status", "/snooze", "/cardio", "/training", "/test", "/debug", "/ai-insight"];
     if (protectedPaths.includes(url.pathname)) {
       const key = request.headers.get("X-API-Key") || url.searchParams.get("key");
       if (!env.API_SECRET || key !== env.API_SECRET) {
@@ -58,6 +58,15 @@ export default {
     if (url.pathname === "/status" && request.method === "POST") {
       const status = await request.json();
       await env.SUBSCRIPTIONS.put("status", JSON.stringify(status));
+      return new Response("OK", { headers: CORS_HEADERS });
+    }
+
+    if (url.pathname === "/snooze" && request.method === "POST") {
+      const { compoundIds, minutes } = await request.json();
+      const snoozeUntil = Date.now() + (minutes || 15) * 60000;
+      for (const id of compoundIds || []) {
+        await env.SUBSCRIPTIONS.put(`snoozeUntil:${id}`, String(snoozeUntil), { expirationTtl: 3600 });
+      }
       return new Response("OK", { headers: CORS_HEADERS });
     }
 
@@ -101,6 +110,8 @@ export default {
         adherence: checkAdherenceDrop,
         cycleend: checkCycleEndReminder,
         plateau: checkPlateauAlert,
+        correlation: checkWeeklyCorrelationInsight,
+        snoozed: checkSnoozedReminders,
       };
       const result = checks[type] ? await checks[type](env, force) : await checkAndSendDue(env, force);
       return new Response(result, { headers: CORS_HEADERS });
@@ -230,6 +241,7 @@ export default {
 
   async scheduled(event, env, ctx) {
     ctx.waitUntil(checkAndSendDue(env, false));
+    ctx.waitUntil(checkSnoozedReminders(env, false));
     ctx.waitUntil(checkCardioSummary(env, false));
     ctx.waitUntil(checkWeeklyImportReminder(env, false));
     ctx.waitUntil(checkLowSupply(env, false));
@@ -241,6 +253,7 @@ export default {
     ctx.waitUntil(checkAdherenceDrop(env, false));
     ctx.waitUntil(checkCycleEndReminder(env, false));
     ctx.waitUntil(checkPlateauAlert(env, false));
+    ctx.waitUntil(checkWeeklyCorrelationInsight(env, false));
   },
 };
 
@@ -317,7 +330,36 @@ function passesTrainingFilter(p, trainingType) {
   return p.trainingDays.includes(trainingType);
 }
 
-async function sendPush(env, title, body) {
+// Reusable single-turn text-only Anthropic call, for scheduled/automated
+// checks that don't need the full conversation/image handling the
+// interactive /ai-insight endpoint supports.
+async function callAnthropicText(env, promptText, maxTokens = 1024) {
+  if (!env.ANTHROPIC_API_KEY) return null;
+  try {
+    const res = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "x-api-key": env.ANTHROPIC_API_KEY,
+        "anthropic-version": "2023-06-01",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "claude-sonnet-5",
+        max_tokens: maxTokens,
+        thinking: { type: "disabled" },
+        messages: [{ role: "user", content: [{ type: "text", text: promptText }] }],
+      }),
+    });
+    if (!res.ok) return null;
+    const data = await res.json();
+    const text = (data.content || []).filter((b) => b.type === "text").map((b) => b.text).join("\n");
+    return text || null;
+  } catch (e) {
+    return null;
+  }
+}
+
+async function sendPush(env, title, body, data = null) {
   const subRaw = await env.SUBSCRIPTIONS.get("subscription");
   if (!subRaw) return "no subscription stored yet";
 
@@ -328,7 +370,7 @@ async function sendPush(env, title, body) {
     privateJWK,
     subscription,
     message: {
-      payload: { title, body },
+      payload: { title, body, data },
       adminContact: env.VAPID_SUBJECT,
       options: { ttl: 3600, urgency: "high" },
     },
@@ -365,7 +407,7 @@ async function checkAndSendDue(env, force) {
     for (const t of times) {
       const mins = timeToMinutes(t);
       if (force || (mins >= windowStart && mins < windowEnd)) {
-        due.push({ name: p.name, dose: p.dose, unit: p.unit });
+        due.push({ id: p.id, name: p.name, dose: p.dose, unit: p.unit });
       }
     }
   }
@@ -383,7 +425,7 @@ async function checkAndSendDue(env, force) {
   const body = names.join("\n");
   const title = `${due.length} dose${due.length > 1 ? "s" : ""} due now`;
 
-  return sendPush(env, title, body);
+  return sendPush(env, title, body, { type: "dose-reminder", date: today, compoundIds: due.map((d) => d.id) });
 }
 
 async function checkCardioSummary(env, force) {
@@ -449,6 +491,40 @@ async function getStatus(env) {
 // Event-driven (not time-based): runs every cron tick, but only actually
 // sends once per compound crossing the threshold — resets automatically
 // once dosesRemaining goes back above it (e.g., after a refill).
+// Event-driven, checked every cron tick: re-sends a reminder once its
+// snooze period has elapsed, unless the compound already shows a taken
+// dose today (avoids an annoying double-notification if it was handled
+// through the app directly instead of via Snooze/Mark Taken).
+async function checkSnoozedReminders(env, force) {
+  const list = await env.SUBSCRIPTIONS.list({ prefix: "snoozeUntil:" });
+  if (list.keys.length === 0) return "no snoozed reminders";
+
+  const status = await getStatus(env);
+  const takenTodayIds = status.takenTodayIds || [];
+
+  const peptidesRaw = await env.SUBSCRIPTIONS.get("peptides");
+  const supplementsRaw = await env.SUBSCRIPTIONS.get("supplements");
+  const all = [...(peptidesRaw ? JSON.parse(peptidesRaw) : []), ...(supplementsRaw ? JSON.parse(supplementsRaw) : [])];
+
+  const now = Date.now();
+  const due = [];
+  for (const key of list.keys) {
+    const compoundId = key.name.replace("snoozeUntil:", "");
+    const snoozeUntil = Number(await env.SUBSCRIPTIONS.get(key.name));
+    if (!force && now < snoozeUntil) continue;
+    await env.SUBSCRIPTIONS.delete(key.name);
+    if (takenTodayIds.includes(compoundId)) continue;
+    const compound = all.find((p) => p.id === compoundId);
+    if (compound) due.push(compound);
+  }
+
+  if (due.length === 0) return "nothing to re-remind";
+
+  const body = due.map((p) => (p.dose && p.unit ? `${p.name} (${p.dose}${p.unit})` : p.name)).join("\n");
+  const title = `${due.length} snoozed dose${due.length > 1 ? "s" : ""}`;
+  return sendPush(env, title, body, { type: "dose-reminder", date: todayKey(), compoundIds: due.map((p) => p.id) });
+}
+
 async function checkLowSupply(env, force) {
   const peptidesRaw = await env.SUBSCRIPTIONS.get("peptides");
   const supplementsRaw = await env.SUBSCRIPTIONS.get("supplements");
@@ -612,7 +688,41 @@ async function checkAdherenceDrop(env, force) {
   return sendPush(env, "Adherence dropped this week", body);
 }
 
+const CORRELATION_CHECK_TIME = "19:00";
 const CYCLE_END_WARNING_DAYS = 3;
+
+async function checkWeeklyCorrelationInsight(env, force) {
+  if (!force) {
+    if (currentDayOfWeek() !== WEEKLY_CHECK_DAY) return "not the weekly check day";
+    const { matches } = inCurrentWindow(CORRELATION_CHECK_TIME, currentMinutes());
+    if (!matches) return "not correlation-check time yet";
+  }
+  const today = todayKey();
+  if (!force) {
+    const sentKey = `correlationSent:${today}`;
+    const already = await env.SUBSCRIPTIONS.get(sentKey);
+    if (already) return "already sent today";
+    await env.SUBSCRIPTIONS.put(sentKey, "1", { expirationTtl: 86400 });
+  }
+  const status = await getStatus(env);
+  if (!status.fullDataSummary) return "no data summary synced yet";
+
+  const prompt =
+    "You're looking at someone's own personal health-tracking data (macros, weight, training, body composition, blood work). " +
+    "Look across all of it for ONE specific, non-obvious correlation or pattern worth pointing out — something connecting two different metrics " +
+    "(e.g. sleep vs. next-day training performance, weekend eating vs. weekly weight trend, cardio consistency vs. resting heart rate). " +
+    "Only surface something if the data actually supports it — if nothing stands out, say so plainly rather than reaching for something weak. " +
+    "Do not recommend or reference any compound, supplement, or medication. This is not medical advice. " +
+    "Respond in 1-2 short sentences, plain language, suitable for a push notification — no preamble, no headers, just the finding.\n\n" +
+    "DATA:\n" + status.fullDataSummary;
+
+  const text = await callAnthropicText(env, prompt, 300);
+  if (!text) return "AI call failed or returned nothing";
+  if (/nothing (stands out|notable)|no (clear|obvious) (pattern|correlation)/i.test(text) && text.length < 150) {
+    return "AI found nothing notable this week";
+  }
+  return sendPush(env, "Weekly insight", text.trim());
+}
 const PLATEAU_CHECK_TIME = "18:45";
 const PLATEAU_MAX_WEIGHT_CHANGE_LB = 1;
 const MIN_WEIGHT_DAYS_FOR_PLATEAU = 14;
