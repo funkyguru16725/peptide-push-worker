@@ -453,7 +453,18 @@ async function checkLowSupply(env, force) {
   const peptidesRaw = await env.SUBSCRIPTIONS.get("peptides");
   const supplementsRaw = await env.SUBSCRIPTIONS.get("supplements");
   const all = [...(peptidesRaw ? JSON.parse(peptidesRaw) : []), ...(supplementsRaw ? JSON.parse(supplementsRaw) : [])];
-  const low = all.filter((p) => p.dosesRemaining != null && p.dosesRemaining <= LOW_SUPPLY_THRESHOLD && p.dosesRemaining >= 0);
+
+  function dosesRemainingEquivalent(p) {
+    if (p.dosesRemaining == null) return null;
+    const dose = Number(p.dose);
+    if (!dose) return null;
+    return p.dosesRemaining / dose;
+  }
+
+  const low = all.filter((p) => {
+    const eq = dosesRemainingEquivalent(p);
+    return eq != null && eq <= LOW_SUPPLY_THRESHOLD && eq >= 0;
+  });
 
   const results = [];
   for (const p of low) {
@@ -466,13 +477,17 @@ async function checkLowSupply(env, force) {
   // Clear the flag for anything that's been refilled back above the threshold,
   // so a future low-supply dip notifies again instead of staying silenced.
   for (const p of all) {
-    if (p.dosesRemaining != null && p.dosesRemaining > LOW_SUPPLY_THRESHOLD) {
+    const eq = dosesRemainingEquivalent(p);
+    if (eq != null && eq > LOW_SUPPLY_THRESHOLD) {
       await env.SUBSCRIPTIONS.delete(`lowSupplyNotified:${p.id}`);
     }
   }
   if (results.length === 0) return "nothing low on supply";
 
-  const body = results.map((p) => `${p.name}: ${p.dosesRemaining} dose${p.dosesRemaining === 1 ? "" : "s"} left`).join("\n");
+  const body = results.map((p) => {
+    const doses = Math.floor(dosesRemainingEquivalent(p));
+    return `${p.name}: ${p.dosesRemaining}${p.unit || ""} left (~${doses} dose${doses === 1 ? "" : "s"})`;
+  }).join("\n");
   return sendPush(env, "Running low on supply", body);
 }
 
