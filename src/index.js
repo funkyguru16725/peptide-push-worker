@@ -99,6 +99,8 @@ export default {
         markers: checkFlaggedMarkers,
         progress: checkProgressReminder,
         adherence: checkAdherenceDrop,
+        cycleend: checkCycleEndReminder,
+        plateau: checkPlateauAlert,
       };
       const result = checks[type] ? await checks[type](env, force) : await checkAndSendDue(env, force);
       return new Response(result, { headers: CORS_HEADERS });
@@ -237,6 +239,8 @@ export default {
     ctx.waitUntil(checkFlaggedMarkers(env, false));
     ctx.waitUntil(checkProgressReminder(env, false));
     ctx.waitUntil(checkAdherenceDrop(env, false));
+    ctx.waitUntil(checkCycleEndReminder(env, false));
+    ctx.waitUntil(checkPlateauAlert(env, false));
   },
 };
 
@@ -592,5 +596,70 @@ async function checkAdherenceDrop(env, force) {
   const body = dropped.map((c) => `${c.name}: ${c.taken}/${c.eligible} this week`).join("\n");
   return sendPush(env, "Adherence dropped this week", body);
 }
- 
+
+const CYCLE_END_WARNING_DAYS = 3;
+const PLATEAU_CHECK_TIME = "18:45";
+const PLATEAU_MAX_WEIGHT_CHANGE_LB = 1;
+const MIN_WEIGHT_DAYS_FOR_PLATEAU = 14;
+const MIN_CALORIE_DAYS_FOR_PLATEAU = 10;
+
+async function checkPlateauAlert(env, force) {
+  if (!force) {
+    if (currentDayOfWeek() !== WEEKLY_CHECK_DAY) return "not the weekly check day";
+    const { matches } = inCurrentWindow(PLATEAU_CHECK_TIME, currentMinutes());
+    if (!matches) return "not plateau-check time yet";
+  }
+  const today = todayKey();
+  if (!force) {
+    const sentKey = `plateauSent:${today}`;
+    const already = await env.SUBSCRIPTIONS.get(sentKey);
+    if (already) return "already sent today";
+    await env.SUBSCRIPTIONS.put(sentKey, "1", { expirationTtl: 86400 });
+  }
+  const status = await getStatus(env);
+  const { goal, plateauSignal } = status;
+  if (!goal || goal.type !== "lose_fat") return "no active fat-loss goal";
+  if (!plateauSignal) return "no plateau signal synced yet";
+  const { weightChange21d, avgCalories21d, calorieGoal, daysOfWeightData, daysOfCalorieData } = plateauSignal;
+  if (daysOfWeightData < MIN_WEIGHT_DAYS_FOR_PLATEAU || daysOfCalorieData < MIN_CALORIE_DAYS_FOR_PLATEAU) return "not enough data yet";
+  if (weightChange21d == null || avgCalories21d == null || !calorieGoal) return "missing data";
+  if (avgCalories21d >= calorieGoal) return "not in a deficit";
+  if (Math.abs(weightChange21d) >= PLATEAU_MAX_WEIGHT_CHANGE_LB) return "weight is still moving";
+
+  return sendPush(
+    env,
+    "Possible plateau",
+    `Weight has moved only ${weightChange21d} lb over the last 3 weeks despite averaging ${avgCalories21d} kcal/day (goal ${calorieGoal}). Might be worth reassessing intake.`
+  );
+}
+
+// Event-driven, like low supply: checks every cron tick, dedup keyed to the
+// specific compound + end date so changing/extending a course re-arms it.
+async function checkCycleEndReminder(env, force) {
+  const peptidesRaw = await env.SUBSCRIPTIONS.get("peptides");
+  const supplementsRaw = await env.SUBSCRIPTIONS.get("supplements");
+  const all = [...(peptidesRaw ? JSON.parse(peptidesRaw) : []), ...(supplementsRaw ? JSON.parse(supplementsRaw) : [])];
+  const today = todayKey();
+  const ending = all.filter((p) => {
+    if (!p.endDate) return false;
+    const daysLeft = daysBetween(today, p.endDate);
+    return daysLeft >= 0 && daysLeft <= CYCLE_END_WARNING_DAYS;
+  });
+
+  const results = [];
+  for (const p of ending) {
+    const key = `cycleEndNotified:${p.id}:${p.endDate}`;
+    const already = await env.SUBSCRIPTIONS.get(key);
+    if (!force && already) continue;
+    await env.SUBSCRIPTIONS.put(key, "1", { expirationTtl: (CYCLE_END_WARNING_DAYS + 2) * 86400 });
+    results.push(p);
+  }
+  if (results.length === 0) return "no cycles ending soon";
+
+  const body = results.map((p) => {
+    const daysLeft = daysBetween(today, p.endDate);
+    return `${p.name}: ${daysLeft === 0 ? "ends today" : `ends in ${daysLeft} day${daysLeft === 1 ? "" : "s"}`}`;
+  }).join("\n");
+  return sendPush(env, "Cycle ending soon", body);
+}
 
